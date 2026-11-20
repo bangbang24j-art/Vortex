@@ -1,5 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/python
-import os, sys, time, json, re, ast, math, uuid, base64, hashlib, shutil, socket, sqlite3, platform, subprocess, threading, urllib.parse, secrets, string, py_compile
+import os, sys, time, json, re, ast, math, uuid, base64, hashlib
+import shutil, socket, sqlite3, platform, subprocess, threading
+import urllib.parse, secrets, string, py_compile
 from pathlib import Path
 import requests
 from rich.console import Console
@@ -14,374 +16,226 @@ DB_PATH = BASE_DIR / "vortex.db"
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 WORKSPACE.mkdir(parents=True, exist_ok=True)
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, time TEXT, user TEXT, reply TEXT, model TEXT, step_time REAL, total_cumulative REAL)")
-        conn.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, val TEXT)")
-init_db()
+with sqlite3.connect(DB_PATH) as conn:
+    conn.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, time TEXT, user TEXT, reply TEXT, model TEXT, step_time REAL, total_cumulative REAL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, val TEXT)")
 
-def get_cfg(key, default):
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT val FROM config WHERE key=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else default
+def get_cfg(k, d):
+    with sqlite3.connect(DB_PATH) as c:
+        r = c.execute("SELECT val FROM config WHERE key=?", (k,)).fetchone()
+        return json.loads(r[0]) if r else d
 
-def set_cfg(key, val):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR REPLACE INTO config (key, val) VALUES (?,?)", (key, json.dumps(val)))
+def set_cfg(k, v):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT OR REPLACE INTO config (key, val) VALUES (?,?)", (k, json.dumps(v)))
 
 if get_cfg("active_model", "") in ("", "qwen-coder"):
     set_cfg("active_model", "chatgpt")
 
-def add_cumulative_time(seconds_added):
-    total = float(get_cfg("all_time_thinking_sec", 0.0)) + float(seconds_added)
-    count = int(get_cfg("all_time_thinking_count", 0)) + 1
-    set_cfg("all_time_thinking_sec", total)
-    set_cfg("all_time_thinking_count", count)
-    return total, count
+def add_cum_time(sec):
+    tot = float(get_cfg("all_sec", 0.0)) + float(sec)
+    cnt = int(get_cfg("all_cnt", 0)) + 1
+    set_cfg("all_sec", tot)
+    set_cfg("all_cnt", cnt)
+    return tot, cnt
 
-def format_duration(sec):
-    sec = float(sec)
-    if sec < 60:
-        return f"{sec:.1f} detik"
-    mins = int(sec // 60)
-    rem_sec = sec % 60
-    if mins < 60:
-        return f"{mins} menit {rem_sec:.1f} detik"
-    hrs = int(mins // 60)
-    rem_mins = mins % 60
-    return f"{hrs} jam {rem_mins} menit {rem_sec:.1f} detik"
+def fmt_dur(s):
+    s = float(s)
+    if s < 60: return f"{s:.1f} detik"
+    m, rs = int(s // 60), s % 60
+    if m < 60: return f"{m} menit {rs:.1f} detik"
+    return f"{m//60} jam {m%60} menit {rs:.1f} detik"
 
-def save_chat(user, reply, model, step_t, cum_t):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO history (time, user, reply, model, step_time, total_cumulative) VALUES (?,?,?,?,?,?)",
-                     (time.strftime("%Y-%m-%d %H:%M:%S"), user, reply, model, round(step_t, 2), round(cum_t, 2)))
+def save_chat(u, r, m, st, ct):
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute("INSERT INTO history (time,user,reply,model,step_time,total_cumulative) VALUES (?,?,?,?,?,?)",
+                  (time.strftime("%Y-%m-%d %H:%M:%S"), u, r, m, round(st, 2), round(ct, 2)))
 
-def get_chats(limit=6):
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT time, user, reply, model, step_time, total_cumulative FROM history ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def get_chats(lim=5):
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute("SELECT time,user,reply,model,step_time,total_cumulative FROM history ORDER BY id DESC LIMIT ?", (lim,)).fetchall()
     return list(reversed(rows))
 
-def run_step_with_timer(label, func, *args):
-    stop_evt = threading.Event()
-    elapsed = [0.0]
-    def ticker():
+def run_timer(label, fn, *args):
+    ev = threading.Event()
+    el = [0.0]
+    def tick():
         t0 = time.perf_counter()
-        while not stop_evt.is_set():
-            elapsed[0] = time.perf_counter() - t0
-            sys.stdout.write(f"\r\033[1;33m[⏳] {label}... ({format_duration(elapsed[0])})\033[K\033[0m")
+        while not ev.is_set():
+            el[0] = time.perf_counter() - t0
+            sys.stdout.write(f"\r\033[1;33m[⏳] {label}... ({fmt_dur(el[0])})\033[K\033[0m")
             sys.stdout.flush()
             time.sleep(0.1)
-    t = threading.Thread(target=ticker, daemon=True)
+    t = threading.Thread(target=tick, daemon=True)
     t.start()
-    try:
-        res = func(*args)
-    finally:
-        stop_evt.set()
-        t.join()
-    dur_str = format_duration(elapsed[0])
-    log_line = f"{label} -> Selesai dalam {dur_str}"
-    sys.stdout.write(f"\r\033[1;32m[✓] {log_line}\033[K\033[0m\n")
+    try: res = fn(*args)
+    finally: ev.set(); t.join()
+    log = f"{label} -> Selesai dalam {fmt_dur(el[0])}"
+    sys.stdout.write(f"\r\033[1;32m[✓] {log}\033[K\033[0m\n")
     sys.stdout.flush()
-    return res, elapsed[0], log_line
+    return res, el[0], log
 
-def resolve_path(p):
-    raw = str(p).strip()
-    return Path(os.path.expanduser(raw)).resolve() if raw else WORKSPACE
+def rpath(p):
+    s = str(p).strip()
+    return Path(os.path.expanduser(s)).resolve() if s else WORKSPACE
 
-def t_python_runner(arg="main.py"):
-    p = resolve_path(arg)
-    if not p.exists(): return f"File tidak ditemukan: {p}"
-    r = subprocess.run([sys.executable, str(p)], capture_output=True, text=True, timeout=30)
-    return (r.stdout + r.stderr).strip() or "[Selesai tanpa output]"
+def run_sh(cmd):
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=45)
+    return (p.stdout + p.stderr).strip() or "[Selesai]"
 
-def t_code_writer(arg=""):
-    parts = arg.split("|", 1)
-    if len(parts) < 2: return "Format: (code_writer nama_file.py | isi_kode)"
-    p = resolve_path(parts[0].strip())
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(parts[1].strip(), encoding="utf-8")
-    return f"Kode disimpan ke {p} ({len(parts[1])} bytes)"
+def t_py(a="main.py"):
+    p = rpath(a)
+    return run_sh(f"python '{p}'") if p.exists() else f"Tidak ada: {p}"
 
-def t_code_reader(arg=""):
-    p = resolve_path(arg)
-    if not p.exists(): return f"File tidak ditemukan: {p}"
-    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines))
+def t_write(a=""):
+    pts = a.split("|", 1)
+    if len(pts) < 2: return "Format: (code_writer file.py | kode)"
+    p = rpath(pts[0]); p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(pts[1].strip(), encoding="utf-8")
+    return f"Disimpan: {p}"
 
-def t_code_debugger(arg=""):
-    p = resolve_path(arg)
-    if not p.exists(): return f"File tidak ditemukan: {p}"
-    try:
-        ast.parse(p.read_text(encoding="utf-8"), filename=p.name)
-        return f"[OK] AST & Sintaks Python pada {p.name} 100% valid."
-    except SyntaxError as e:
-        return f"[BUG DITEMUKAN] Baris {e.lineno}: {e.msg}\nKode: {e.text}"
+def t_read(a=""):
+    p = rpath(a)
+    if not p.exists(): return "File tidak ditemukan."
+    return "\n".join(f"{i+1:3d} | {l}" for i, l in enumerate(p.read_text(errors="replace").splitlines()))
 
-def t_syntax_checker(arg=""):
-    p = resolve_path(arg)
-    if not p.exists(): return f"File tidak ditemukan: {p}"
-    try:
-        py_compile.compile(str(p), doraise=True)
-        return f"[VALID] {p.name} berhasil dikompilasi."
-    except Exception as e:
-        return f"[INVALID] {e}"
+def t_debug(a=""):
+    p = rpath(a)
+    if not p.exists(): return "File tidak ditemukan."
+    try: ast.parse(p.read_text()); return f"[OK] Sintaks {p.name} valid."
+    except SyntaxError as e: return f"[BUG] Baris {e.lineno}: {e.msg}"
 
-def t_code_analyzer(arg=""):
-    p = resolve_path(arg)
-    if not p.exists(): return f"File tidak ditemukan: {p}"
-    txt = p.read_text(encoding="utf-8", errors="replace")
-    lines = txt.splitlines()
-    funcs = len(re.findall(r"^\s*def\s+\w+", txt, re.M))
-    classes = len(re.findall(r"^\s*class\s+\w+", txt, re.M))
-    return f"File: {p.name} | Total Baris: {len(lines)} | Fungsi: {funcs} | Class: {classes}"
+def t_app(a="my_app"):
+    n = a.strip() or "my_app"
+    bp = Path(os.environ.get("PREFIX", "/data/data/com.termux/files/usr")) / "bin" / n
+    bp.write_text(f"#!/data/data/com.termux/files/usr/bin/python\nprint('=== {n.upper()} AKTIF ===')\n")
+    os.chmod(bp, 0o755)
+    return f"Aplikasi '{n}' terpasang! Ketik '{n}' di Termux."
 
-def t_html_builder(arg="index.html"):
-    p = resolve_path(arg or "index.html")
-    p.write_text("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Vortex App</title></head><body><h1>VORTEX AI</h1><p>Created by vzxTeam</p></body></html>", encoding="utf-8")
-    return f"HTML dibuat di: {p}"
+def t_sys(a=""):
+    m = run_sh("getprop ro.product.model")
+    v = run_sh("getprop ro.build.version.release")
+    return f"Device: {m} (Android {v})\nKernel: {platform.release()} ({platform.machine()})\nPython: {platform.python_version()}"
 
-def t_project_creator(arg="my_project"):
-    d = resolve_path(WORKSPACE / (arg.strip() or "my_project"))
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "main.py").write_text(f"print('Project {d.name} Running!')\n", encoding="utf-8")
-    (d / "README.md").write_text(f"# {d.name}\nGenerated by VORTEX AI.\n", encoding="utf-8")
-    return f"Proyek lengkap dibuat di: {d}"
+def t_store(a=""):
+    u = shutil.disk_usage(Path.home()); g = 1024**3
+    return f"Total: {u.total/g:.1f}GB | Terpakai: {u.used/g:.1f}GB | Sisa: {u.free/g:.1f}GB"
 
-def t_app_builder(arg="my_cli"):
-    name = arg.strip() or "my_cli"
-    d = Path.home() / name
-    d.mkdir(parents=True, exist_ok=True)
-    app_py = d / "main.py"
-    app_py.write_text(f"#!/data/data/com.termux/files/usr/bin/python\nprint('=== APLIKASI {name.upper()} AKTIF ===')\n", encoding="utf-8")
-    os.chmod(app_py, 0o755)
-    bin_p = Path(os.environ.get("PREFIX", "/data/data/com.termux/files/usr")) / "bin" / name
-    bin_p.write_text(f"#!/data/data/com.termux/files/usr/bin/bash\npython {app_py} \"$@\"\n", encoding="utf-8")
-    os.chmod(bin_p, 0o755)
-    return f"Aplikasi '{name}' berhasil dipasang! Ketik '{name}' di terminal."
+def t_files(a="."):
+    p = rpath(a)
+    if not p.exists(): return "Tidak ditemukan."
+    return "\n".join(f"{'[D]' if x.is_dir() else '[F]'} {x.name}" for x in sorted(p.iterdir())[:50])
 
-def t_terminal(arg=""):
-    if not arg: return "Contoh: (terminal pkg list-installed)"
-    r = subprocess.run(arg, shell=True, capture_output=True, text=True, timeout=45)
-    return (r.stdout + r.stderr).strip() or "[Selesai]"
-
-def t_system_info(arg=""):
-    model = subprocess.run("getprop ro.product.model", shell=True, capture_output=True, text=True).stdout.strip()
-    ver = subprocess.run("getprop ro.build.version.release", shell=True, capture_output=True, text=True).stdout.strip()
-    return f"Device : {model} (Android {ver})\nKernel : {platform.system()} {platform.release()} ({platform.machine()})\nPython : {platform.python_version()}"
-
-def t_storage_info(arg=""):
-    u = shutil.disk_usage(Path.home())
-    gb = 1024**3
-    return f"Total: {u.total/gb:.2f} GB | Terpakai: {u.used/gb:.2f} GB | Sisa: {u.free/gb:.2f} GB"
-
-def t_memory_info(arg=""):
-    p = Path("/proc/meminfo")
-    return "\n".join(p.read_text().splitlines()[:8]) if p.exists() else "Info RAM tidak tersedia."
-
-def t_network_status(arg=""):
-    try:
-        t0 = time.perf_counter()
-        ip = socket.gethostbyname("one.one.one.one")
-        return f"ONLINE | DNS: 1.1.1.1 ({ip}) | Latency: {(time.perf_counter()-t0)*1000:.1f} ms"
-    except Exception as e:
-        return f"OFFLINE: {e}"
-
-def t_file_manager(arg="."):
-    p = resolve_path(arg)
-    if not p.exists(): return f"Path tidak ditemukan: {p}"
-    items = [f"{'[DIR] ' if x.is_dir() else '[FILE]'} {x.name}" for x in sorted(p.iterdir())]
-    return f"Direktori {p}:\n" + ("\n".join(items[:50]) if items else "(Kosong)")
-
-def t_file_search(arg=""):
-    if not arg: return "Contoh: (file_search .py)"
-    found = [str(p.relative_to(Path.home())) for p in Path.home().rglob(f"*{arg}*") if ".git" not in str(p)][:30]
-    return "\n".join(found) if found else "Tidak ditemukan."
-
-def t_file_delete(arg=""):
-    p = resolve_path(arg)
-    if not p.exists(): return "Target tidak ditemukan."
-    if p.is_dir(): shutil.rmtree(p)
-    else: p.unlink()
-    return f"Berhasil dihapus: {p}"
-
-def t_calculator(arg="25 * 4"):
-    try: return f"{arg} = {eval(arg, {'__builtins__': None}, math.__dict__)}"
-    except Exception as e: return f"Error: {e}"
-
-def t_password_gen(arg="16"):
-    n = max(8, min(64, int(arg or 16)))
-    return "".join(secrets.choice(string.ascii_letters + string.digits + "!@#$%^&*") for _ in range(n))
-
-def t_hash_gen(arg="vortex"):
-    return f"SHA256: {hashlib.sha256(arg.encode()).hexdigest()}\nMD5   : {hashlib.md5(arg.encode()).hexdigest()}"
+def t_calc(a="25*4"):
+    try: return f"{a} = {eval(a, {'__builtins__': None}, math.__dict__)}"
+    except Exception as e: return str(e)
 
 TOOLS = {
-    "python_runner": ("CODING", "Jalankan file Python & tangkap outputnya", t_python_runner),
-    "code_writer": ("CODING", "Tulis kode ke file (nama.py | kode)", t_code_writer),
-    "code_reader": ("CODING", "Baca source code dengan nomor baris", t_code_reader),
-    "code_debugger": ("CODING", "Cek AST bug & syntax error pada file Python", t_code_debugger),
-    "syntax_checker": ("CODING", "Uji kompilasi file Python", t_syntax_checker),
-    "code_analyzer": ("CODING", "Hitung jumlah baris, fungsi, dan class", t_code_analyzer),
-    "html_builder": ("CODING", "Buat template halaman HTML5", t_html_builder),
-    "project_creator": ("CODING", "Buat folder proyek lengkap di workspace", t_project_creator),
-    "app_builder": ("CODING", "Buat aplikasi CLI & pasang ke bin Termux", t_app_builder),
-    "terminal": ("SYSTEM", "Jalankan perintah bash & tools luar bebas", t_terminal),
-    "system_info": ("SYSTEM", "Info lengkap perangkat Android & Termux", t_system_info),
-    "storage_info": ("SYSTEM", "Info kapasitas memori internal HP", t_storage_info),
-    "memory_info": ("SYSTEM", "Info penggunaan RAM aktual", t_memory_info),
-    "network_status": ("SYSTEM", "Cek koneksi internet & ping DNS", t_network_status),
-    "file_manager": ("FILES", "Lihat daftar file di direktori", t_file_manager),
-    "file_search": ("FILES", "Cari file di penyimpanan Termux", t_file_search),
-    "file_delete": ("FILES", "Hapus file atau folder", t_file_delete),
-    "calculator": ("UTILS", "Kalkulator matematika ilmiah", t_calculator),
-    "password_generator": ("UTILS", "Generator password aman", t_password_gen),
-    "hash_generator": ("UTILS", "Buat hash SHA256 & MD5", t_hash_gen),
+    "python_runner": ("CODING", "Jalankan file Python", t_py),
+    "code_writer": ("CODING", "Tulis kode ke file (nama|isi)", t_write),
+    "code_reader": ("CODING", "Baca isi kode file", t_read),
+    "code_debugger": ("CODING", "Cek bug sintaks Python", t_debug),
+    "app_builder": ("CODING", "Buat aplikasi CLI ke bin Termux", t_app),
+    "terminal": ("SYSTEM", "Jalankan perintah bash & tools luar", run_sh),
+    "system_info": ("SYSTEM", "Info HP Android & Termux", t_sys),
+    "storage_info": ("SYSTEM", "Cek sisa penyimpanan HP", t_store),
+    "file_manager": ("FILES", "Lihat daftar file direktori", t_files),
+    "calculator": ("UTILS", "Kalkulator matematika ilmiah", t_calc),
 }
 
-MODELS_CATALOG = {
-    "1": ("chatgpt", "ChatGPT (OpenAI GPT-4o-mini) - Default Tanpa API Key"),
+MODELS = {
+    "1": ("chatgpt", "ChatGPT (GPT-4o-mini) - Default Tanpa API Key"),
     "2": ("gemini", "Google Gemini Flash/Pro"),
     "3": ("llama", "Meta Llama 3.3 70B"),
 }
 
-SYSTEM_PROMPT = """Anda adalah VORTEX AI, Autonomous Agent di Termux Android.
-ATURAN EKSEKUSI:
-1. Jika user hanya mengobrol atau bertanya, jawab langsung tanpa tag <file> atau <shell>.
-2. Jika user meminta membuat aplikasi, kode, atau file, wajib gunakan tag:
+SYS_PROMPT = """Anda adalah VORTEX AI, Agen Penuh Termux Android.
+1. Jika hanya ngobrol, jawab langsung.
+2. Jika diminta membuat file/aplikasi, gunakan:
 <file path="~/nama_file">
-isi kode lengkap
+isi kode
 </file>
-3. Jika user meminta instalasi tools atau menjalankan script, wajib gunakan tag:
+3. Jika diminta instal tools/jalankan perintah terminal, gunakan:
 <shell>
-perintah bash satu baris
+perintah bash
 </shell>"""
 
-def request_ai_backend(prompt_text):
-    choice = get_cfg("active_model", "chatgpt")
-    api_keys = get_cfg("api_keys", {})
-    personal_key = api_keys.get(choice, "").strip()
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for _, u, rep, _, _, _ in get_chats(4):
-        messages.append({"role": "user", "content": u})
-        messages.append({"role": "assistant", "content": rep[:700]})
-    messages.append({"role": "user", "content": prompt_text})
+def ask_ai(prompt):
+    ch = get_cfg("active_model", "chatgpt")
+    key = get_cfg("api_keys", {}).get(ch, "").strip()
+    msgs = [{"role": "system", "content": SYS_PROMPT}]
+    for _, u, r, _, _, _ in get_chats(3):
+        msgs.append({"role": "user", "content": u})
+        msgs.append({"role": "assistant", "content": r[:600]})
+    msgs.append({"role": "user", "content": prompt})
 
-    if personal_key:
+    if key:
         try:
-            if choice == "chatgpt":
-                r = requests.post("https://api.openai.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {personal_key}"},
-                    json={"model": "gpt-4o-mini", "messages": messages}, timeout=45)
-                if r.status_code == 200:
-                    return True, r.json()["choices"][0]["message"]["content"], "ChatGPT (Personal API)"
-            elif choice == "gemini":
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={personal_key}"
-                merged = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
-                r = requests.post(url, json={"contents": [{"parts": [{"text": merged}]}]}, timeout=45)
-                if r.status_code == 200:
-                    return True, r.json()["candidates"][0]["content"]["parts"][0]["text"], "Gemini (Personal API)"
-            elif choice == "llama":
-                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {personal_key}"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": messages}, timeout=45)
-                if r.status_code == 200:
-                    return True, r.json()["choices"][0]["message"]["content"], "Llama (Personal API)"
+            if ch == "chatgpt":
+                r = requests.post("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, json={"model": "gpt-4o-mini", "messages": msgs}, timeout=40)
+                if r.status_code == 200: return True, r.json()["choices"][0]["message"]["content"], "ChatGPT (API)"
+            elif ch == "gemini":
+                u = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+                txt = "\n".join(f"{m['role']}: {m['content']}" for m in msgs)
+                r = requests.post(u, json={"contents": [{"parts": [{"text": txt}]}]}, timeout=40)
+                if r.status_code == 200: return True, r.json()["candidates"][0]["content"]["parts"][0]["text"], "Gemini (API)"
+            elif ch == "llama":
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {key}"}, json={"model": "llama-3.3-70b-versatile", "messages": msgs}, timeout=40)
+                if r.status_code == 200: return True, r.json()["choices"][0]["message"]["content"], "Llama (API)"
         except Exception as e:
-            return False, f"API Key Pribadi Error: {e}", choice.upper()
+            return False, f"API Error: {e}", ch.upper()
 
-    for mod in ["openai", "openai-fast"]:
+    for m in ["openai", "openai-fast"]:
         try:
-            r = requests.post("https://text.pollinations.ai/", json={"messages": messages, "model": mod}, timeout=45)
+            r = requests.post("https://text.pollinations.ai/", json={"messages": msgs, "model": m}, timeout=40)
             if r.status_code == 200 and r.text.strip() and '"status":40' not in r.text:
-                return True, r.text.strip(), f"{choice.upper()}"
-        except Exception:
-            pass
+                return True, r.text.strip(), ch.upper()
+        except Exception: pass
 
     try:
-        q = urllib.parse.quote(f"{SYSTEM_PROMPT}\nUser: {prompt_text}"[:1500])
-        r2 = requests.get(f"https://text.pollinations.ai/{q}", timeout=45)
-        if r2.status_code == 200 and r2.text.strip():
-            return True, r2.text.strip(), f"{choice.upper()}"
+        q = urllib.parse.quote(f"{SYS_PROMPT}\nUser: {prompt}"[:1400])
+        r2 = requests.get(f"https://text.pollinations.ai/{q}", timeout=40)
+        if r2.status_code == 200 and r2.text.strip(): return True, r2.text.strip(), ch.upper()
     except Exception as e:
-        return False, f"Gagal terhubung ke AI: {e}", choice.upper()
-    return False, "Server sedang sibuk. Silakan coba lagi.", choice.upper()
+        return False, f"Gagal terhubung: {e}", ch.upper()
+    return False, "Server sibuk, coba lagi.", ch.upper()
 
-def write_file_helper(fname, code):
-    target = resolve_path(fname)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(code, encoding="utf-8")
-    if str(target).endswith((".py", ".sh")) or "/bin/" in str(target):
-        os.chmod(target, 0o755)
-    return str(target)
+def save_f(fn, code):
+    p = rpath(fn); p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(code, encoding="utf-8"); os.chmod(p, 0o755)
+    return str(p)
 
-def run_shell_helper(cmd):
-    p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=45)
-    return (p.stdout + p.stderr).strip() or "[Selesai dijalankan]"
-
-def process_chat_with_timers(user_prompt):
-    step_logs = []
-    turn_total_sec = 0.0
-    active_name = get_cfg("active_model", "chatgpt").upper()
-
-    (ok, raw_reply, used_model), think_sec, think_log = run_step_with_timer(
-        f"AI ({active_name}) sedang berpikir", request_ai_backend, user_prompt
-    )
-    step_logs.append(think_log)
-    turn_total_sec += think_sec
-
+def handle_chat(u):
+    logs, outs, turn_t = [], [], 0.0
+    act = get_cfg("active_model", "chatgpt").upper()
+    (ok, raw, mod), ts, tl = run_timer(f"AI ({act}) sedang berpikir", ask_ai, u)
+    logs.append(tl); turn_t += ts
     if not ok:
-        add_cumulative_time(turn_total_sec)
-        console.print(Panel(f"[bold red]{raw_reply}[/bold red]", title="ERROR", border_style="red"))
-        return
+        add_cum_time(turn_t)
+        console.print(Panel(f"[red]{raw}[/red]", title="ERROR", border_style="red")); return
 
-    exec_outputs = []
-    for m in re.finditer(r'<file\s+path=["\']([^"\']+)["\']\s*>(.*?)</file>', raw_reply, re.DOTALL | re.IGNORECASE):
-        fname = m.group(1).strip()
-        code = re.sub(r'^```\w*\n|\n```$', '', m.group(2).strip())
-        try:
-            saved_path, f_sec, f_log = run_step_with_timer(
-                f"Aksi membuat/mengubah file '{fname}'", write_file_helper, fname, code
-            )
-            step_logs.append(f_log)
-            turn_total_sec += f_sec
-            exec_outputs.append(f"[✓] File disimpan: {saved_path}")
-        except Exception as e:
-            exec_outputs.append(f"[✗] Gagal membuat file {fname}: {e}")
+    for m in re.finditer(r'<file\s+path=["\']([^"\']+)["\']\s*>(.*?)</file>', raw, re.S | re.I):
+        fn, cd = m.group(1).strip(), re.sub(r'^```\w*\n|\n```$', '', m.group(2).strip())
+        sp, fs, fl = run_timer(f"Aksi membuat file '{fn}'", save_f, fn, cd)
+        logs.append(fl); turn_t += fs; outs.append(f"[✓] File: {sp}")
 
-    for m in re.finditer(r'<shell>(.*?)</shell>', raw_reply, re.DOTALL | re.IGNORECASE):
-        cmds = re.sub(r'^```\w*\n|\n```$', '', m.group(1).strip()).splitlines()
-        for cmd in cmds:
+    for m in re.finditer(r'<shell>(.*?)</shell>', raw, re.S | re.I):
+        for cmd in re.sub(r'^```\w*\n|\n```$', '', m.group(1).strip()).splitlines():
             cmd = cmd.strip()
             if not cmd or cmd.startswith("#"): continue
-            try:
-                cmd_out, s_sec, s_log = run_step_with_timer(
-                    f"Aksi mengeksekusi '{cmd}'", run_shell_helper, cmd
-                )
-                step_logs.append(s_log)
-                turn_total_sec += s_sec
-                exec_outputs.append(f"$ {cmd}\n{cmd_out[:700]}")
-            except Exception as e:
-                exec_outputs.append(f"$ {cmd} -> ({e})")
+            co, ss, sl = run_timer(f"Aksi eksekusi '{cmd}'", run_sh, cmd)
+            logs.append(sl); turn_t += ss; outs.append(f"$ {cmd}\n{co[:600]}")
 
-    cum_sec, cum_cnt = add_cumulative_time(turn_total_sec)
-    clean_reply = re.sub(r'<file\s+path=.*?>.*?</file>', '', raw_reply, flags=re.DOTALL | re.IGNORECASE)
-    clean_reply = re.sub(r'<shell>.*?</shell>', '', clean_reply, flags=re.DOTALL | re.IGNORECASE)
-    clean_reply = re.sub(r'</?reply>', '', clean_reply, flags=re.IGNORECASE).strip() or "Selesai dieksekusi."
-
-    console.print(Panel(Markdown(clean_reply), title=f"[bold bright_green]{used_model}[/bold bright_green]", border_style="bright_green"))
-    if exec_outputs:
-        console.print(Panel("\n\n".join(exec_outputs), title="[bold bright_cyan]HASIL EKSEKUSI AKSI[/bold bright_cyan]", border_style="cyan"))
-
-    timer_report = "\n".join(f"• {l}" for l in step_logs) + (
-        f"\n────────────────────────────────────────────────────────\n"
-        f"⏱️  [bold yellow]Total Waktu Giliran Ini :[/bold yellow] {format_duration(turn_total_sec)}\n"
-        f"🧠 [bold bright_magenta]Total Akumulasi Mikir & Aksi (Sejak Pertama Kali / {cum_cnt}x Proses) :[/bold bright_magenta] [bold bright_green]{format_duration(cum_sec)}[/bold bright_green]"
-    )
-    console.print(Panel(timer_report, title="[bold yellow]STATISTIK WAKTU PEMIKIRAN & AKSI AI[/bold yellow]", border_style="magenta"))
-    save_chat(user_prompt, clean_reply, used_model, turn_total_sec, cum_sec)
+    cum_s, cum_c = add_cum_time(turn_t)
+    clean = re.sub(r'<file.*?>.*?</file>|<shell>.*?</shell>|</?reply>', '', raw, flags=re.S | re.I).strip() or "Selesai."
+    console.print(Panel(Markdown(clean), title=f"[bold green]{mod}[/bold green]", border_style="green"))
+    if outs: console.print(Panel("\n\n".join(outs), title="HASIL EKSEKUSI", border_style="cyan"))
+    rep = "\n".join(f"• {l}" for l in logs) + f"\n────────────────────────────────────\n⏱️ Giliran Ini: {fmt_dur(turn_t)}\n🧠 Total Akumulasi Mikir ({cum_c}x): [bold green]{fmt_dur(cum_s)}[/bold green]"
+    console.print(Panel(rep, title="STATISTIK WAKTU MIKIR & AKSI", border_style="magenta"))
+    save_chat(u, clean, mod, turn_t, cum_s)
 
 def show_note():
-    note_content = (
+    txt = (
         "Note: untuk membuka lagi tools dengan mengetik \"vortex\" atau \"python main.py\". "
         "Tools ini dalam tahap pengembangan, jika ada bug laporkan ke nomor ini:\n\n"
         "[bold bright_blue][link=https://wa.me/628987566890]628987566890[/link][/bold bright_blue]\n"
@@ -389,24 +243,68 @@ def show_note():
         "Ketuk nomor jika ingin melaporkan bug\n\n"
         "[bold italic]Created by vzxTeam[/bold italic]"
     )
-    console.print(Panel(note_content, title="[bold bright_cyan]NOTE[/bold bright_cyan]", border_style="bright_cyan"))
+    console.print(Panel(txt, title="[bold cyan]NOTE[/bold cyan]", border_style="cyan"))
 
-def show_dashboard():
+def show_dash():
     os.system("clear")
-    active = get_cfg("active_model", "chatgpt").upper()
-    cum_sec = float(get_cfg("all_time_thinking_sec", 0.0))
-    cum_cnt = int(get_cfg("all_time_thinking_count", 0))
+    act = get_cfg("active_model", "chatgpt").upper()
+    cs, cc = float(get_cfg("all_sec", 0.0)), int(get_cfg("all_cnt", 0))
     console.print(Panel(
-        "[bold bright_cyan]██╗   ██╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗     █████╗ ██╗\n"
-        "██║   ██║██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝    ██╔══██╗██║\n"
-        "╚██╗ ██╔╝██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝     ███████║██║\n"
-        " ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗    ██║  ██║██║\n"
-        "  ╚═══╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝    ╚═╝  ╚═╝╚═╝[/bold bright_cyan]",
+        "[bold bright_cyan]██╗   ██╗ ██████╗ ██████╗ ████████╗███████╗██╗  ██╗\n"
+        "╚██╗ ██╔╝██║   ██║██████╔╝   ██║   █████╗   ╚███╔╝\n"
+        " ╚████╔╝ ╚██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗[/bold bright_cyan]",
         subtitle="[bold italic]Created by vzxTeam[/bold italic]", border_style="bright_cyan"
     ))
-    tbl = Table(show_header=False, box=None, expand=True)
-    tbl.add_column("K", style="bold bright_green", width=20)
-    tbl.add_column("V", style="white")
-    tbl.add_row("ACTIVE AI", f"[bold bright_cyan]{active}[/bold bright_cyan]")
-    tbl.add_row("TOTAL WAKTU MIKIR", f"[bold yellow]{format_duration(cum_sec)}[/bold yellow] ({cum_cnt}x pemikiran/aksi)")
-    tbl.add_row("TOOLS TERSEDIA", f"[bold green]{len(TOOLS)} Functional Tools[/bold green] (Ketik [bold cyan]tools[/bold cyan] atau [bold c
+    t = Table(show_header=False, box=None, expand=True)
+    t.add_column("K", style="bold green", width=18); t.add_column("V", style="white")
+    t.add_row("ACTIVE AI", f"[bold cyan]{act}[/bold cyan]")
+    t.add_row("TOTAL MIKIR", f"[bold yellow]{fmt_dur(cs)}[/bold yellow] ({cc}x proses)")
+    t.add_row("TOOLS READY", f"{len(TOOLS)} Tools (Panggil: [cyan](nama_tool)[/cyan])")
+    t.add_row("COMMANDS", "[cyan]Note[/cyan] | [cyan]model[/cyan] | [cyan]apikey[/cyan] | [cyan]tools[/cyan] | [cyan]history[/cyan] | [cyan]clear[/cyan] | [cyan]exit[/cyan]")
+    console.print(Panel(t, title="[bold green]VORTEX TELEMETRY[/bold green]", border_style="green"))
+
+def main():
+    show_dash()
+    while True:
+        try:
+            u = input("\n\033[1;32mchat:\033[0m ").strip()
+            if not u: continue
+            low = u.lower()
+            if low in ("exit", "quit", "keluar"): break
+            if low in ("clear", "cls"): show_dash(); continue
+            if low == "note": show_note(); continue
+            if low == "tools":
+                tb = Table(title="VORTEX TOOLS", expand=True)
+                tb.add_column("Kat", style="magenta"); tb.add_column("Panggil", style="cyan"); tb.add_column("Fungsi")
+                for k, (c, d, _) in TOOLS.items(): tb.add_row(c, f"({k})", d)
+                console.print(tb); continue
+            if low == "model":
+                for k, (m, d) in MODELS.items(): console.print(f"[{k}] {m.upper()} - {d}")
+                c = input("Pilih (1-3): ").strip()
+                if c in MODELS: set_cfg("active_model", MODELS[c][0]); show_dash()
+                continue
+            if low == "apikey":
+                act = get_cfg("active_model", "chatgpt"); ks = get_cfg("api_keys", {})
+                k = input(f"API Key {act.upper()} (Enter=Gratis): ").strip()
+                if k: ks[act] = k
+                else: ks.pop(act, None)
+                set_cfg("api_keys", ks); console.print("[green]Tersimpan![/green]"); continue
+            if low == "history":
+                rows = get_chats(10)
+                txt = "\n\n".join(f"[{t}] {m} (Aksi: {fmt_dur(s)} | Total: {fmt_dur(c)})\n  chat: {usr}\n  AI: {r[:100]}..." for t, usr, r, m, s, c in rows)
+                console.print(Panel(txt or "Kosong.", title="HISTORY", border_style="magenta")); continue
+            tm = re.match(r"^\(([a-zA-Z0-9_\-]+)(?:\s+(.*))?\)$", u)
+            if tm:
+                tn, ta = tm.group(1), (tm.group(2) or "").strip("\"'")
+                fn = TOOLS[tn][2] if tn in TOOLS else lambda x: run_sh(f"{tn} {x}".strip())
+                out, ts, _ = run_timer(f"Menjalankan ({tn})", fn, ta)
+                cs, _ = add_cum_time(ts)
+                console.print(Panel(str(out), title=f"({tn})", subtitle=f"Waktu: {fmt_dur(ts)} | Total: {fmt_dur(cs)}", border_style="cyan"))
+                continue
+            handle_chat(u)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Ketik 'exit' untuk keluar.[/yellow]")
+
+if __name__ == "__main__":
+    main()
+        
